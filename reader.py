@@ -45,8 +45,77 @@ class EnhancedFinancialParser:
                 for key, pattern in patterns.items()}
 
     def extract_forward_guidance(self) -> List[str]:
-        return [sent.text.strip() for sent in self.doc.sents 
-                if any(word in sent.text.lower() for word in ["expect", "anticipate", "project", "future", "outlook"])][:5]
+        # Define more specific forward-looking terms and financial indicators
+        forward_terms = ["expect", "anticipate", "project", "future", "outlook", "forecast", "plan", "intend", "believe"]
+        financial_terms = ["revenue", "growth", "margin", "profit", "earnings", "cash flow", "expense", "investment", 
+                         "market share", "guidance", "target", "goal", "estimate"]
+        
+        # Define terms to exclude (boilerplate text)
+        exclude_terms = ["forward-looking statements", "contain words such as", "similar terms or expressions",
+                        "identify forward-looking statements", "words such as", "similar terms"]
+        
+        # Score and collect relevant sentences
+        guidance_sentences = []
+        for sent in self.doc.sents:
+            text = sent.text.lower()
+            
+            # Skip boilerplate text about forward-looking statements
+            if any(exclude_term in text for exclude_term in exclude_terms):
+                continue
+                
+            # Check for forward-looking terms
+            has_forward_term = any(term in text for term in forward_terms)
+            # Check for financial/business terms
+            has_financial_term = any(term in text for term in financial_terms)
+            
+            if has_forward_term and has_financial_term:
+                # Score sentence based on importance indicators
+                score = 0
+                if any(term in text for term in ["guidance", "target", "goal"]):
+                    score += 2
+                if any(term in text for term in ["revenue", "growth", "margin"]):
+                    score += 1
+                if any(term in text for term in ["increase", "decrease", "improve", "decline"]):
+                    score += 1
+                
+                # Additional scoring for sentence quality
+                if len(sent.text.split()) > 8:  # Prefer longer, more complete sentences
+                    score += 1
+                if any(char in sent.text for char in ['$', '%']):  # Prefer sentences with specific metrics
+                    score += 2
+                
+                guidance_sentences.append((score, sent.text.strip()))
+        
+        # Sort by score and remove duplicates
+        guidance_sentences.sort(reverse=True, key=lambda x: x[0])
+        unique_sentences = []
+        seen = set()
+        
+        for score, sentence in guidance_sentences:
+            # More sophisticated deduplication
+            words = set(sentence.lower().split())
+            is_duplicate = False
+            for seen_sentence in seen:
+                seen_words = set(seen_sentence.lower().split())
+                # If more than 70% of words are the same, consider it a duplicate
+                if len(words.intersection(seen_words)) / len(words) > 0.7:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                # Clean up the sentence
+                sentence = re.sub(r'\s+', ' ', sentence)  # Remove extra whitespace
+                sentence = sentence.strip()
+                
+                # Only include if it's a complete thought
+                if len(sentence.split()) >= 6 and sentence.endswith(('.', '!', '?')):
+                    unique_sentences.append(sentence)
+                    seen.add(sentence)
+            
+            if len(unique_sentences) >= 5:  # Increased from 3 to 5
+                break
+        
+        return unique_sentences
 
     def analyze_sentiment(self) -> Dict[str, float]:
         sections = {
@@ -56,17 +125,84 @@ class EnhancedFinancialParser:
         return {section: TextBlob(match.group(0)).sentiment.polarity if match else 0.0 
                 for section, match in sections.items()}
 
-    def business_updates_summary(self) -> List[str]:
-        updates = []
+    def business_updates_summary(self) -> Dict[str, List[str]]:
+        # Define categories and their keywords
+        categories = {
+            "Segment Performance": {
+                "keywords": ["mobility", "delivery", "freight", "segment", "business unit"],
+                "metrics": ["revenue", "growth", "margin", "volume", "orders", "users"],
+                "score": 3
+            },
+            "Strategic Initiatives": {
+                "keywords": ["investment", "acquisition", "partnership", "expansion", "launch", "new market"],
+                "metrics": ["investment", "acquisition", "partnership", "expansion"],
+                "score": 2
+            },
+            "Technology & Innovation": {
+                "keywords": ["technology", "innovation", "product", "feature", "platform", "system"],
+                "metrics": ["development", "launch", "upgrade", "integration"],
+                "score": 2
+            }
+        }
+        
+        # Collect and score updates
+        updates = {category: [] for category in categories}
+        seen_updates = set()
+        
         for sent in self.doc.sents:
             text = sent.text.lower()
-            if "mobility" in text or "delivery" in text:
-                updates.append(f"Segment update: {sent.text.strip()}")
-            elif "investment" in text or "acquisition" in text:
-                updates.append(f"Strategic move: {sent.text.strip()}")
-            elif "regulation" in text or "compliance" in text:
-                updates.append(f"Regulatory note: {sent.text.strip()}")
-        return updates[:5]
+            
+            # Skip financial statements and boilerplate text
+            if any(term in text for term in ["condensed consolidated", "statements of operations", "assets", "liabilities"]):
+                continue
+                
+            doc = nlp(sent.text)
+            
+            # Extract any numeric values or percentages
+            metrics = []
+            for token in doc:
+                if token.like_num or token.text.endswith('%'):
+                    metrics.append(token.text)
+            
+            for category, config in categories.items():
+                # Check if sentence contains category keywords
+                has_keyword = any(keyword in text for keyword in config["keywords"])
+                has_metric = any(metric in text for metric in config["metrics"])
+                
+                if has_keyword:
+                    # Calculate relevance score
+                    score = config["score"]
+                    if has_metric:
+                        score += 1
+                    if metrics:
+                        score += 1
+                    
+                    # Format the update
+                    update_text = sent.text.strip()
+                    if metrics:
+                        update_text = f"{update_text} (Metrics: {', '.join(metrics)})"
+                    
+                    # Check for duplicates
+                    words = set(text.split())
+                    is_duplicate = False
+                    for seen_update in seen_updates:
+                        seen_words = set(seen_update.lower().split())
+                        if len(words.intersection(seen_words)) / len(words) > 0.7:
+                            is_duplicate = True
+                            break
+                    
+                    if not is_duplicate:
+                        updates[category].append((score, update_text))
+                        seen_updates.add(update_text)
+        
+        # Process and return top updates for each category
+        result = {}
+        for category, category_updates in updates.items():
+            # Sort by score and take top 2
+            category_updates.sort(reverse=True, key=lambda x: x[0])
+            result[category] = [update[1] for update in category_updates[:2]]
+        
+        return result
 
     def segment_specific_updates(self) -> Dict[str, List[str]]:
         segments = {"Mobility": [], "Delivery": [], "Freight": []}
@@ -205,23 +341,22 @@ def main():
         parser = EnhancedFinancialParser(args.filename)
         results = parser.parse_full_report()
 
-        print("### Numeric Metrics")
+        print("### Key Metrics")
         for key, value in results["numeric_metrics"].items():
-            print(f"{key}: {value}")
+            if key not in ["total_assets", "cash"]:  # Skip detailed balance sheet items
+                print(f"{key}: {value}")
 
         print("\n### Forward Guidance")
         for stmt in results["forward_guidance"]:
             print(f"- {stmt}")
 
-        print("\n### Sentiment Analysis")
-        for section, score in results["sentiment"].items():
-            print(f"{section}: {score:.2f}")
-
         print("\n### Business Updates")
-        for update in results["business_updates"]:
-            print(f"- {update}")
+        for category, updates in results["business_updates"].items():
+            print(f"\n{category}:")
+            for update in updates:
+                print(f"- {update}")
 
-        print("\n### Segment-Specific Updates")
+        print("\n### Segment Performance")
         for segment, updates in results["segment_updates"].items():
             print(f"\n{segment}:")
             for update in updates:
@@ -237,7 +372,7 @@ def main():
             for item in items:
                 print(f"- {item}")
 
-        print("\n### Hidden Insights")
+        print("\n### Key Insights")
         for insight in results["hidden_insights"]:
             print(f"- {insight}")
 
